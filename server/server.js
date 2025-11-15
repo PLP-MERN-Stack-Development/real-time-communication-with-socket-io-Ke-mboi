@@ -1,132 +1,149 @@
-// server.js - Main server file for Socket.io chat application
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+// Users and rooms storage
+const users = new Map(); // socketId -> { username, room }
+const rooms = new Map(); // room -> { messages: [], members: Set() }
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+// Helper: update online users to all clients
+function updateOnlineUsers() {
+  const onlineUsernames = Array.from(users.values()).map(u => u.username);
+  io.emit('presence:update', onlineUsernames);
+}
 
-// Socket.io connection handler
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  const username = socket.handshake.query.username || 'Anonymous';
+  users.set(socket.id, { username, room: 'global' });
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+  // Join default room
+  socket.join('global');
+  if (!rooms.has('global')) rooms.set('global', { messages: [], members: new Set() });
+  rooms.get('global').members.add(username);
+
+  // Initial online users
+  updateOnlineUsers();
+  io.to('global').emit('notification', { type: 'join', username });
+
+  // Join room
+  socket.on('room:join', ({ room }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    const prevRoom = u.room;
+    socket.leave(prevRoom);
+    u.room = room;
+    socket.join(room);
+
+    if (!rooms.has(room)) rooms.set(room, { messages: [], members: new Set() });
+    rooms.get(room).members.add(u.username);
+
+    socket.emit('room:history', { room, messages: rooms.get(room).messages });
+    io.to(room).emit('notification', { type: 'join', username: u.username });
+
+    updateOnlineUsers();
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
+  // Room text messages
+  socket.on('room:message', ({ room, text }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    const msg = {
+      id: Math.random().toString(36).slice(2, 9),
+      from: u.username,
+      text,
+      room,
       timestamp: new Date().toISOString(),
+      readBy: [u.username]
     };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
+    if (!rooms.has(room)) rooms.set(room, { messages: [], members: new Set() });
+    rooms.get(room).messages.push(msg);
+    io.to(room).emit('room:message', msg);
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
-
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
+  // Room file messages
+  socket.on('room:file', ({ room, fileName, fileData }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    const msg = {
+      id: Math.random().toString(36).slice(2, 9),
+      from: u.username,
+      fileName,
+      fileData,
+      room,
       timestamp: new Date().toISOString(),
-      isPrivate: true,
+      readBy: [u.username]
     };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+    if (!rooms.has(room)) rooms.set(room, { messages: [], members: new Set() });
+    rooms.get(room).messages.push(msg);
+    io.to(room).emit('room:file', msg);
   });
 
-  // Handle disconnection
+  // Typing indicator
+  socket.on('room:typing', ({ room, typing }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    socket.to(room).emit('room:typing', { username: u.username, typing });
+  });
+
+  // Reactions
+  socket.on('room:reaction', ({ room, messageId, reaction }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    const roomData = rooms.get(room);
+    if (!roomData) return;
+    const msg = roomData.messages.find(m => m.id === messageId);
+    if (!msg) return;
+    if (!msg.reactions) msg.reactions = {};
+    if (!msg.reactions[reaction]) msg.reactions[reaction] = [];
+    if (!msg.reactions[reaction].includes(u.username)) msg.reactions[reaction].push(u.username);
+    io.to(room).emit('room:update', roomData.messages);
+  });
+
+  // Read receipts
+  socket.on('room:read', ({ room }) => {
+    const u = users.get(socket.id);
+    if (!u || !rooms.has(room)) return;
+    rooms.get(room).messages.forEach(msg => {
+      if (!msg.readBy.includes(u.username)) msg.readBy.push(u.username);
+    });
+    io.to(room).emit('room:update', rooms.get(room).messages);
+  });
+
+  // Private messages
+  socket.on('private:message', ({ toUsername, text, fileName, fileData }) => {
+    const u = users.get(socket.id);
+    if (!u) return;
+    const targetSocketId = Array.from(users.entries()).find(([id, user]) => user.username === toUsername)?.[0];
+    if (!targetSocketId) return;
+
+    const msg = {
+      id: Math.random().toString(36).slice(2, 9),
+      from: u.username,
+      text: text || null,
+      fileName: fileName || null,
+      fileData: fileData || null,
+      room: null,
+      timestamp: new Date().toISOString()
+    };
+
+    io.to(targetSocketId).emit('private:message', msg);
+    socket.emit('private:message', msg);
+  });
+
+  // Disconnect
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    const u = users.get(socket.id);
+    if (!u) return;
+    io.to(u.room).emit('notification', { type: 'leave', username: u.username });
+    users.delete(socket.id);
+    updateOnlineUsers();
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
-
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-module.exports = { app, server, io }; 
+server.listen(4000, () => console.log('Server running on port 4000'));
